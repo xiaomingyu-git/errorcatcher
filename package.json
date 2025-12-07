@@ -1,0 +1,69 @@
+{
+  "name": "electron-vue3-folder-url",
+  "version": "0.1.0",
+  "description": "Minimal Electron + Vue3 app with folder picker and URL opener",
+  "author": "Xmy",
+  "main": "main.js",
+  "type": "commonjs",
+  "scripts": {
+    "dev": "concurrently -k \"npm:dev:vite\" \"npm:dev:electron\"",
+    "dev:vite": "vite",
+    "dev:electron": "node scripts/dev-electron.js",
+    "build": "vite build",
+    "start": "electron .",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder"
+  },
+  "dependencies": {
+    "ffmpeg-static": "^5.2.0",
+    "vue": "^3.4.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.0.0",
+    "concurrently": "^9.0.0",
+    "cross-env": "^7.0.3",
+    "electron": "^31.0.0",
+    "electron-builder": "^24.9.0",
+    "vite": "^5.4.0",
+    "wait-on": "^7.0.1"
+  },
+  "build": {
+    "appId": "com.electron-vue3.app",
+    "productName": "Electron Vue3 Demo",
+    "files": [
+      "main.js",
+      "preload.js",
+      "child-preload.js",
+      "dist/**",
+      "node_modules/ffmpeg-static/**"
+    ],
+    "directories": {
+      "buildResources": "assets"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "sign": null
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Electron Vue3 Demo"
+    }
+  }
+}
+
