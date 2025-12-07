@@ -9,7 +9,6 @@ const devServerUrl = process.env.VITE_DEV_SERVER_URL || 'http://localhost:5173';
 // 获取 ffmpeg 二进制文件路径
 function getFFmpegPath() {
   try {
-    // 优先使用打包内的 ffmpeg
     const ffmpegStatic = require('ffmpeg-static');
     if (ffmpegStatic && fs.existsSync(ffmpegStatic)) {
       return ffmpegStatic;
@@ -17,23 +16,14 @@ function getFFmpegPath() {
   } catch (err) {
     // ffmpeg-static 未安装，继续尝试系统 ffmpeg
   }
-  // 降级到系统 ffmpeg
   return 'ffmpeg';
 }
 
 const FFMPEG_PATH = getFFmpegPath();
 
 let selectedFolder = '';
-/**
- * windows: Map<webContentsId, {
- *  win: BrowserWindow,
- *  recording: boolean,
- *  recordingPaths: { eventLog, networkLog, framesDir } | null,
- *  captureInterval?: NodeJS.Timeout,
- *  networkListener?: Function
- * }>
- */
 const windows = new Map();
+let mainWindow = null;
 
 /**
  * Creates the main renderer window.
@@ -55,10 +45,11 @@ function createMainWindow() {
     win.loadFile(path.join(__dirname, 'dist', 'index.html'));
   }
 
+  mainWindow = win;
   return win;
 }
 
-function openUrlWindow(url) {
+function openUrlWindow(url, parentWindowId = null) {
   const child = new BrowserWindow({
     width: 1200,
     height: 800,
@@ -75,7 +66,8 @@ function openUrlWindow(url) {
     recording: false,
     recordingPaths: null,
     captureInterval: null,
-    networkListener: null
+    networkListener: null,
+    parentWindowId: parentWindowId
   });
 
   child.on('closed', () => {
@@ -102,7 +94,7 @@ function timestamp() {
 }
 
 function appendLine(filePath, payload) {
-  fs.appendFile(filePath, `${JSON.stringify(payload)}\n`, () => {});
+  fs.appendFileSync(filePath, `${JSON.stringify(payload)}\n`);
 }
 
 function startRecording(windowId) {
@@ -127,6 +119,7 @@ function startRecording(windowId) {
 
   entry.recordingPaths = { eventLog, networkLog, framesDir };
   entry.recording = true;
+  entry.isMoving = false;
 
   // Network capture
   const session = entry.win.webContents.session;
@@ -147,12 +140,25 @@ function startRecording(windowId) {
     session.webRequest.onCompleted(entry.networkListener);
   }
 
+  // 监听窗口移动事件，暂停截图
+  entry.onMoving = () => {
+    entry.isMoving = true;
+  };
+  entry.onMoved = () => {
+    entry.isMoving = false;
+  };
+  entry.win.on('move', entry.onMoving);
+  entry.win.on('moved', entry.onMoved);
+
   // Frame capture
   let frameIndex = 0;
   entry.captureInterval = setInterval(async () => {
     if (!windows.has(windowId)) return;
     const current = windows.get(windowId);
     if (!current || !current.recording || current.win.isDestroyed()) return;
+    
+    if (current.isMoving) return;
+    
     try {
       const image = await current.win.capturePage();
       const file = path.join(current.recordingPaths.framesDir, `${String(frameIndex).padStart(5, '0')}.png`);
@@ -161,10 +167,28 @@ function startRecording(windowId) {
     } catch (err) {
       // ignore capture errors while recording
     }
-  }, 33);
+  }, 100);
 
-  // tell child to start event collection
   entry.win.webContents.send('recording-toggle', { active: true });
+
+  // 在主进程监听子窗口的输入事件
+  const beforeInputHandler = (event, input) => {
+    if (!entry.recording) return;
+    
+    appendLine(entry.recordingPaths.eventLog, {
+      type: 'keydown',
+      key: input.key || '',
+      code: input.code || '',
+      ctrl: input.control,
+      shift: input.shift,
+      alt: input.alt,
+      meta: input.meta,
+      ts: Date.now()
+    });
+  };
+
+  entry.win.webContents.on('before-input-event', beforeInputHandler);
+  entry.beforeInputHandler = beforeInputHandler;
 
   return { success: true, message: `开始录制，输出目录：${runDir}` };
 }
@@ -181,13 +205,32 @@ function stopRecording(windowId) {
       entry.captureInterval = null;
     }
 
+    // 移除窗口移动监听
+    if (entry.onMoving) {
+      entry.win.removeListener('move', entry.onMoving);
+      entry.win.removeListener('moved', entry.onMoved);
+      entry.onMoving = null;
+      entry.onMoved = null;
+    }
+
+    // 移除键盘事件监听
+    if (entry.beforeInputHandler) {
+      entry.win.webContents.removeListener('before-input-event', entry.beforeInputHandler);
+      entry.beforeInputHandler = null;
+    }
+
     if (entry.win && !entry.win.isDestroyed()) {
       entry.win.webContents.send('recording-toggle', { active: false });
     }
 
-    // 停止录制时，合成视频
+    if (entry.networkListener) {
+      const session = entry.win.webContents.session;
+      session.webRequest.onCompleted(null);
+      entry.networkListener = null;
+    }
+
     if (entry.recordingPaths) {
-      const { framesDir, eventLog, networkLog } = entry.recordingPaths;
+      const { framesDir } = entry.recordingPaths;
       const videoFile = path.join(path.dirname(framesDir), 'recording.mp4');
       composeVideo(framesDir, videoFile);
     }
@@ -197,7 +240,6 @@ function stopRecording(windowId) {
 }
 
 function composeVideo(framesDir, outputFile) {
-  // 检查帧文件是否存在
   const files = fs.readdirSync(framesDir).filter((f) => f.endsWith('.png'));
   if (files.length === 0) {
     console.log('没有截图帧，跳过视频合成');
@@ -259,7 +301,9 @@ ipcMain.handle('open-url', async (_event, url) => {
     if (!['http:', 'https:'].includes(parsed.protocol)) {
       return { success: false, message: '仅支持 http/https 链接' };
     }
-    const id = openUrlWindow(parsed.toString());
+    const senderId = _event.sender.id;
+    const parentId = windows.has(senderId) ? senderId : null;
+    const id = openUrlWindow(parsed.toString(), parentId);
     return { success: true, windowId: id };
   } catch (err) {
     return { success: false, message: 'URL 无效，请检查输入' };
@@ -274,6 +318,12 @@ ipcMain.handle('start-recording', (_event, windowId) => {
 ipcMain.handle('stop-recording', (_event, windowId) => {
   stopRecording(windowId);
   return { success: true, message: '已停止录制' };
+});
+
+ipcMain.on('child-window-closing', (event) => {
+  const senderId = event.sender.id;
+  stopRecording(senderId);
+  windows.delete(senderId);
 });
 
 ipcMain.handle('get-status', () => {
@@ -293,6 +343,11 @@ ipcMain.on('record-event', (event, payload) => {
   const senderId = event.sender.id;
   const entry = windows.get(senderId);
   if (!entry || !entry.recording || !entry.recordingPaths) return;
-  appendLine(entry.recordingPaths.eventLog, { ...payload, ts: Date.now() });
+  
+  try {
+    appendLine(entry.recordingPaths.eventLog, { ...payload, ts: Date.now() });
+  } catch (err) {
+    console.error(`写入事件日志失败: ${err.message}`);
+  }
 });
 
